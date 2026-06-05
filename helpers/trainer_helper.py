@@ -90,7 +90,6 @@ class ModelTrainer:
         self.loss_function = config['loss_function']
         self.custom_loss = config['custom_loss']
         self.data_sampler = config['data_sampler']
-        self.diffusion_sampler = config['diffusion_sampler']
 
         # ================================================================
         # Metrics Calculator
