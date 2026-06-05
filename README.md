@@ -26,7 +26,7 @@ The model utilizes the **Electricity Transformer Dataset (ETDataset)**. Before t
 3.  Ensure the output directory matches the path defined in `Runner.py`.
 
 ### Step 2: Model Training & Evaluation
-Once the data is preprocessed, use the `Runner.py` script to initialize the DyFAIP architecture, execute the training loop, and perform imputation evaluation.
+Once the data is preprocessed, use the `Runner.py` script to initialize the FASTER architecture, execute the training loop, and perform imputation evaluation.
 
 ```bash
 python Runner.py
