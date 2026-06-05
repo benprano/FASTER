@@ -1,0 +1,570 @@
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from sklearn.metrics import (
+    average_precision_score, f1_score, mean_absolute_error,
+    mean_squared_error, r2_score, roc_curve, auc
+)
+from tqdm import tqdm
+
+
+class TrainerMetrics:
+    """Modular metrics computation for the training pipeline."""
+
+    def __init__(self, input_dim: int):
+        self.input_dim = input_dim
+
+    @staticmethod
+    def adjusted_r2(actual: np.ndarray, predicted: np.ndarray,
+                    n_samples: np.int64, n_features: np.int64) -> float:
+        """Compute adjusted R² score."""
+        r2 = r2_score(actual, predicted)
+        return 1 - (1 - r2) * (n_samples - 1) / (n_samples - n_features)
+
+    def compute_regression_metrics(self, targets: List[np.ndarray],
+                                   predicted: List[np.ndarray],
+                                   rescale_params: Dict[str, float]) -> List[List[float]]:
+        """Compute regression metrics (RMSE, MAE, R², Adjusted R²)."""
+        scores = []
+        for y_true, y_pred in zip(targets, predicted):
+            # Rescale to original range for meaningful R² calculation
+            mse = mean_squared_error(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            mae = mean_absolute_error(y_true, y_pred)
+            r2 = r2_score(y_true, y_pred)
+            adj_r2 = self.adjusted_r2(
+                y_true, y_pred,
+                y_true.shape[0], self.input_dim
+            )
+
+            scores.append([mse, rmse, mae, adj_r2, adj_r2])
+        return scores
+
+    def compute_imputation_metrics(self, real: List[np.ndarray],
+                                   imputed: List[np.ndarray],
+                                   rescale_params: Dict[str, float]) -> List[List[float]]:
+        """Compute imputation quality metrics."""
+        return self.compute_regression_metrics(real, imputed, rescale_params)
+
+    @staticmethod
+    def compute_binary_metrics(targets: List[np.ndarray],
+                               predicted: List[np.ndarray]) -> List[List[float]]:
+        """Compute binary classification metrics (ROC-AUC, PR-AUC)."""
+        scores = []
+        for idx, (y_true, y_pred) in enumerate(zip(targets, predicted)):
+            fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+            auc_score = auc(fpr, tpr)
+            pr_score = average_precision_score(y_true, y_pred)
+            scores.append([np.round(np.mean(auc_score), 4),
+                           np.round(np.mean(pr_score), 4)])
+        return scores
+
+    @staticmethod
+    def find_best_threshold(predictions: np.ndarray,
+                            y_true: np.ndarray) -> Tuple[float, float]:
+        """Find the optimal threshold for maximizing F1-score."""
+        delta, tmp = 0, [0, 0, 0]  # idx, cur, max
+        for tmp[0] in tqdm(np.arange(0.1, 1.01, 0.01)):
+            tmp[1] = f1_score(y_true, np.array(predictions) > tmp[0])
+            if tmp[1] > tmp[2]:
+                delta = tmp[0]
+                tmp[2] = tmp[1]
+        print('best threshold is {:.2f} with F1 score: {:.4f}'.format(delta, tmp[2]))
+        return delta, tmp[2]
+
+
+class EarlyStopping:
+    """
+    Flexible Early Stopping that works for both classification and regression.
+
+    Saves the best model if EITHER primary metric OR imputation metric improves independently.
+
+    For Classification:
+    - Primary metric: Accuracy (maximize)
+    - Imputation metric: MAE (minimize)
+
+    For Regression:
+    - Primary metric: MSE (minimize)
+    - Imputation metric: MAE (minimize)
+
+    Strategy:
+    =========
+    Save the best model if:
+    - Primary metric improves (task-specific), OR
+    - Imputation MAE improves
+
+    This balances both tasks equally without forcing one to sacrifice the other.
+    """
+
+    def __init__(self,
+                 task: None,
+                 save_path: str = 'best_model.pt',
+                 patience: int = 50,
+                 primary_threshold: float = 0.0001,
+                 imp_threshold: float = 0.00001,
+                 logger: Optional[Any] = None):
+        """
+        Initialize Generic Early Stopping.
+
+        Args:
+            task: 'classification' or 'regression'
+            save_path: Path to save the best model
+            patience: Epochs without improvement before stopping
+            primary_threshold: Minimum improvement for primary metric
+            imp_threshold: Minimum imputation improvement
+            logger: Logger instance
+        """
+        self.task = task
+        self.save_path = save_path
+        self.patience = patience
+        self.primary_threshold = primary_threshold
+        self.imp_threshold = imp_threshold
+        self.logger = logger
+
+        # Track the best values for each goal independently
+        if task:
+            # For classification: maximize accuracy
+            self.best_primary = -np.inf
+            self.primary_mode = 'max'  # Higher is better
+            self.primary_name = 'Accuracy'
+        else:
+            # For regression: minimize MSE
+            self.best_primary = np.inf
+            self.primary_mode = 'min'  # Lower is better
+            self.primary_name = 'MSE'
+
+        self.best_imp = np.inf  # Always minimize imputation MAE
+        self.best_epoch_primary = -1
+        self.best_epoch_imp = -1
+
+        # Overall tracking
+        self.counter = 0
+        self.best_info = {}
+        self.improvement_history = []
+
+    @staticmethod
+    def _safe(text: str) -> str:
+        """Return text encoded to an ASCII-safe string without throwing."""
+        return text.encode("ascii", "replace").decode()
+
+    def _log(self, message: str) -> None:
+        """Log safely (never crashes)."""
+        safe_message = self._safe(message)
+        if self.logger:
+            self.logger.info(safe_message)
+        else:
+            print(safe_message)
+
+    def _check_primary_improvement(self, primary_metric: float) -> bool:
+        """
+        Check if the primary metric improved based on the task type.
+
+        Args:
+            primary_metric: Classification accuracy or Regression MSE
+
+        Returns:
+            True if metric improved
+        """
+        if self.primary_mode == 'max':
+            # Classification: maximize accuracy
+            return primary_metric > self.best_primary + self.primary_threshold
+        else:
+            # Regression: minimize MSE
+            return primary_metric < self.best_primary - self.primary_threshold
+
+    def _get_primary_improvement_str(self, primary_metric: float) -> str:
+        """Format improvement message based on the task type."""
+        if self.primary_mode == 'max':
+            improvement = (primary_metric - self.best_primary) * 100
+            return f"{self.primary_name}: {self.best_primary:.4f} → {primary_metric:.4f} (+{improvement:.2f}%)"
+        else:
+            improvement = (self.best_primary - primary_metric)
+            return f"{self.primary_name}: {self.best_primary:.6f} → {primary_metric:.6f} (-{improvement:.6f})"
+
+    def __call__(self,
+                 primary_metric: float,
+                 imputation_metric: float,
+                 model: torch.nn.Module,
+                 epoch: Optional[int] = None,
+                 extra_metrics: Optional[Dict[str, float]] = None) -> bool:
+        """
+        Check if either metric improved and save the model accordingly.
+
+        Args:
+            primary_metric: Classification accuracy OR Regression MSE
+            imputation_metric: Imputation MAE (always to minimize)
+            model: Model to potentially save
+            epoch: Current epoch number
+            extra_metrics: Additional metrics to track
+
+        Returns:
+            early_stop: Whether to trigger early stopping
+        """
+        epoch_num = epoch + 1 if epoch is not None else 0
+        improvement_detected = False
+        reasons = []
+
+        # ================================================================
+        # OBJECTIVE 1: Primary Task Metric (Classification or Regression)
+        # ================================================================
+        if self._check_primary_improvement(primary_metric):
+            improvement_detected = True
+            reasons.append(self._get_primary_improvement_str(primary_metric))
+            self.best_primary = primary_metric
+            self.best_epoch_primary = epoch_num
+
+        # ================================================================
+        # OBJECTIVE 2: Minimize Imputation MAE
+        # ================================================================
+        if imputation_metric < self.best_imp - self.imp_threshold:
+            improvement_detected = True
+            imp_improvement = self.best_imp - imputation_metric
+            reasons.append(f"Imputation MAE: {self.best_imp:.6f} → {imputation_metric:.6f} (-{imp_improvement:.6f})")
+            self.best_imp = imputation_metric
+            self.best_epoch_imp = epoch_num
+
+        # ================================================================
+        # DECISION: Save or Increment Counter
+        # ================================================================
+        if improvement_detected:
+            self.counter = 0
+
+            # Save model
+            torch.save(model.state_dict(), self.save_path)
+
+            # Log improvement
+            reason_str = " | ".join(reasons)
+            self._log(f"[OK] Epoch {epoch_num}: Validation improved - saved best model weights")
+            self._log(f"  {reason_str}")
+
+            # Store best info
+            self.best_info = {
+                "epoch": epoch_num,
+                "task": self.task,
+                f"best_{self.primary_name.lower()}": round(primary_metric, 6),
+                f"best_{self.primary_name.lower()}_epoch": self.best_epoch_primary,
+                "best_imputation_mae": round(imputation_metric, 6),
+                "best_imputation_mae_epoch": self.best_epoch_imp,
+                "saved_at": datetime.now().isoformat(),
+                "reason": reason_str
+            }
+
+            if extra_metrics:
+                for key, value in extra_metrics.items():
+                    self.best_info[f"extra_{key}"] = round(value, 6) if isinstance(value, float) else value
+
+            self.improvement_history.append({
+                "epoch": epoch_num,
+                "primary_metric": primary_metric,
+                "imputation_metric": imputation_metric,
+                "reason": reason_str
+            })
+
+        else:
+            self.counter += 1
+
+            if self.primary_mode == 'max':
+                primary_gap = (self.best_primary - primary_metric) * 100
+                primary_gap_str = f"{primary_gap:.2f}%"
+            else:
+                primary_gap = (primary_metric - self.best_primary)
+                primary_gap_str = f"{primary_gap:.6f}"
+
+            imp_gap = (imputation_metric - self.best_imp)
+
+            self._log(
+                f"[X] Epoch {epoch_num}: No improvement | "
+                f"{self.primary_name} gap: {primary_gap_str} (best: {self.best_primary:.4f}), "
+                f"Imputation gap: {imp_gap:.6f} (best: {self.best_imp:.6f}) | "
+                f"Counter: {self.counter}/{self.patience}"
+            )
+
+        # Check early stopping
+        early_stop = self.counter >= self.patience
+        if early_stop:
+            self._log(f"[EARLY STOP] Best model achieved at Epoch {epoch_num}")
+            self._log(f"  Best {self.primary_name}: {self.best_primary:.6f} (Epoch {self.best_epoch_primary})")
+            self._log(f"  Best Imputation MAE: {self.best_imp:.6f} (Epoch {self.best_epoch_imp})")
+
+        return early_stop
+
+
+class EarlyStoppingDualObjective:
+    """
+    Generic Early Stopping for BOTH Classification and Regression tasks.
+
+    Strategy:
+    =========
+    Save the best model if EITHER metric improves independently:
+
+    Classification:
+    - Maximize Validation Accuracy (or other primary metric)
+    - Minimize Validation Imputation MAE (or other secondary metric)
+
+    Regression:
+    - Minimize Validation MSE/RMSE (primary prediction metric)
+    - Minimize Validation Imputation MAE (secondary imputation metric)
+
+    This balances both goals without forcing one to sacrifice the other.
+
+    Example (Classification):
+    -------------------------
+    Epoch 10: Acc 0.8689, Imp 0.046788 → SAVE
+    Epoch 11: Acc 0.8679↓, Imp 0.045488↓ → SAVE (imputation improved!)
+    Epoch 12: Acc 0.8661↓, Imp 0.044985↓ → SAVE (imputation improved!)
+    Epoch 14: Acc 0.8640↓, Imp 0.044700↑ → Counter +1 (both worse)
+
+    Example (Regression):
+    --------------------
+    Epoch 10: MSE 0.0234, Imp 0.046788 → SAVE
+    Epoch 11: MSE 0.0232↓, Imp 0.045488↓ → SAVE
+    Epoch 14: MSE 0.0240↑, Imp 0.044700↑ → Counter +1 (both worse)
+    """
+
+    def __init__(self,
+                 save_path: str,
+                 patience: int = 50,
+                 task_type: str = 'classification',
+                 primary_metric: str = 'acc',
+                 primary_threshold: float = 0.0001,
+                 secondary_threshold: float = 0.00001,
+                 logger: Optional[Any] = None):
+        """
+        Initialize Generic Dual-Objective Early Stopping.
+
+        Args:
+            save_path: Path to save the best model
+            patience: Epochs without any improvement before stopping
+            task_type: 'classification' or 'regression'
+            primary_metric: 'acc' (classification), 'mse'/'rmse'/'mae' (regression)
+            primary_threshold: Minimum improvement for primary metric
+            secondary_threshold: Minimum improvement for secondary metric
+            logger: Logger instance
+        """
+        self.save_path = save_path
+        self.patience = patience
+        self.task_type = task_type.lower()
+        self.primary_metric = primary_metric.lower()
+        self.primary_threshold = primary_threshold
+        self.secondary_threshold = secondary_threshold
+        self.logger = logger
+
+        # Validate inputs
+        valid_tasks = ['classification', 'regression']
+        if self.task_type not in valid_tasks:
+            raise ValueError(f"task_type must be one of {valid_tasks}")
+
+        # Determine the optimization direction for the primary metric
+        if self.task_type == 'classification':
+            self.primary_direction = 'maximize'  # Maximize accuracy
+        elif self.primary_metric in ['mse', 'rmse', 'mae']:
+            self.primary_direction = 'minimize'  # Minimize error
+        else:
+            raise ValueError(f"Unknown primary_metric: {self.primary_metric}")
+
+        # Track the best values independently
+        if self.primary_direction == 'maximize':
+            self.best_primary = -np.inf
+        else:
+            self.best_primary = np.inf
+
+        self.best_secondary = np.inf  # Always minimize imputation MAE
+        self.best_epoch_primary = -1
+        self.best_epoch_secondary = -1
+
+        # Overall tracking
+        self.counter = 0
+        self.best_info = {}
+        self.improvement_history = []
+
+    # =====================================================================
+    # LOGGING (Safe ASCII-only)
+    # =====================================================================
+
+    @staticmethod
+    def _safe(text: str) -> str:
+        """Return text encoded to an ASCII-safe string without throwing."""
+        return text.encode("ascii", "replace").decode()
+
+    def _log(self, message: str) -> None:
+        """Log safely (never crashes)."""
+        safe_message = self._safe(message)
+        if self.logger:
+            self.logger.info(safe_message)
+        else:
+            print(safe_message)
+
+    # =====================================================================
+    # IMPROVEMENT CHECK
+    # =====================================================================
+
+    def _check_primary_improvement(self, val_primary: float) -> tuple[bool, float]:
+        """
+        Check if the primary metric improved.
+
+        Returns:
+            improved: Whether metric improved
+            improvement_amount: Magnitude of improvement
+        """
+        if self.primary_direction == 'maximize':
+            improved = val_primary > self.best_primary + self.primary_threshold
+            improvement = (val_primary - self.best_primary) * 100
+        else:  # minimize
+            improved = val_primary < self.best_primary - self.primary_threshold
+            improvement = (self.best_primary - val_primary)
+
+        return improved, improvement
+
+    def _check_secondary_improvement(self, val_secondary: float) -> tuple[bool, float]:
+        """
+        Verify if the secondary metric (imputation MAE) improved.
+
+        Returns:
+            improved: Whether metric improved
+            improvement_amount: Magnitude of improvement
+        """
+        improved = val_secondary < self.best_secondary - self.secondary_threshold
+        improvement = (self.best_secondary - val_secondary)
+        return improved, improvement
+
+    # =====================================================================
+    # MAIN CALL
+    # =====================================================================
+
+    def __call__(self,
+                 val_primary: float,
+                 val_secondary: float,
+                 model: torch.nn.Module,
+                 epoch: Optional[int] = None,
+                 extra_metrics: Optional[Dict[str, float]] = None) -> bool:
+        """
+        Check if either metric improved and save the model accordingly.
+
+        Args:
+            val_primary: Validation primary metric (accuracy, MSE, RMSE, MAE)
+            val_secondary: Validation imputation MAE (or other secondary metric)
+            model: Model to potentially save
+            epoch: Current epoch number
+            extra_metrics: Additional metrics to track
+
+        Returns:
+            early_stop: Whether to trigger early stopping
+        """
+        epoch_num = epoch + 1 if epoch is not None else 0
+        improvement_detected = False
+        reasons = []
+
+        # ================================================================
+        # PRIMARY OBJECTIVE
+        # ================================================================
+        primary_improved, primary_improvement = self._check_primary_improvement(val_primary)
+
+        if primary_improved:
+            improvement_detected = True
+            self.best_primary = val_primary
+            self.best_epoch_primary = epoch_num
+
+            if self.primary_direction == 'maximize':
+                reasons.append(
+                    f"{self.primary_metric.upper()}: {self.best_primary - primary_improvement / 100:.4f} → "
+                    f"{val_primary:.4f} (+{primary_improvement:.2f}%)"
+                )
+            else:
+                reasons.append(
+                    f"{self.primary_metric.upper()}: {self.best_primary + primary_improvement:.6f} → "
+                    f"{val_primary:.6f} (-{primary_improvement:.6f})"
+                )
+
+        # ================================================================
+        # SECONDARY OBJECTIVE: Minimize Imputation MAE
+        # ================================================================
+        secondary_improved, secondary_improvement = self._check_secondary_improvement(val_secondary)
+
+        if secondary_improved:
+            improvement_detected = True
+            self.best_secondary = val_secondary
+            self.best_epoch_secondary = epoch_num
+
+            reasons.append(
+                f"Imputation MAE: {self.best_secondary + secondary_improvement:.6f} → "
+                f"{val_secondary:.6f} (-{secondary_improvement:.6f})"
+            )
+
+        # ================================================================
+        # DECISION: Save or Increment Counter
+        # ================================================================
+        if improvement_detected:
+            self.counter = 0
+
+            # Save model
+            torch.save(model.state_dict(), self.save_path)
+
+            # Log improvement
+            reason_str = " | ".join(reasons)
+            self._log(f"[OK] Epoch {epoch_num}: Validation improved - saved best model")
+            self._log(f"     {reason_str}")
+
+            # Store best info
+            self.best_info = {
+                "epoch": epoch_num,
+                f"best_{self.primary_metric}": round(val_primary, 6),
+                f"best_{self.primary_metric}_epoch": self.best_epoch_primary,
+                "best_secondary": round(val_secondary, 6),
+                "best_secondary_epoch": self.best_epoch_secondary,
+                "task_type": self.task_type,
+                "saved_at": datetime.now().isoformat(),
+                "reason": reason_str
+            }
+
+            if extra_metrics:
+                for key, value in extra_metrics.items():
+                    self.best_info[f"extra_{key}"] = round(value, 6) if isinstance(value, float) else value
+
+            self.improvement_history.append({
+                "epoch": epoch_num,
+                "primary": val_primary,
+                "secondary": val_secondary,
+                "reason": reason_str
+            })
+
+        else:
+            self.counter += 1
+
+            if self.primary_direction == 'maximize':
+                primary_gap = (self.best_primary - val_primary) * 100
+                gap_str = f"Acc gap: {primary_gap:.2f}%"
+            else:
+                primary_gap = (val_primary - self.best_primary)
+                gap_str = f"{self.primary_metric.upper()} gap: {primary_gap:.6f}"
+
+            secondary_gap = (val_secondary - self.best_secondary)
+
+            self._log(
+                f"[X] Epoch {epoch_num}: No improvement | "
+                f"{gap_str} (best: {self.best_primary:.4f}), "
+                f"Imp gap: {secondary_gap:.6f} (best: {self.best_secondary:.6f}) | "
+                f"Counter: {self.counter}/{self.patience}"
+            )
+
+        # ================================================================
+        # CHECK EARLY STOPPING
+        # ================================================================
+        early_stop = self.counter >= self.patience
+
+        if early_stop:
+            self._log(f"\n[EARLY STOPPING] Patience exceeded at Epoch {epoch_num}")
+            self._log(
+                f"  Best {self.primary_metric.upper()}: {self.best_primary:.6f} (Epoch {self.best_epoch_primary})")
+            self._log(f"  Best Imputation MAE: {self.best_secondary:.6f} (Epoch {self.best_epoch_secondary})")
+
+        return early_stop
+
+    def get_best_metrics(self) -> Dict[str, Any]:
+        """Get a dictionary of the best metrics achieved."""
+        return self.best_info.copy()
+
+    def get_improvement_history(self) -> list:
+        """Get a history of all improvements."""
+        return self.improvement_history.copy()
