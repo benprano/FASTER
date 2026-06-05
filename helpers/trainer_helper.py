@@ -47,7 +47,6 @@ class ModelTrainer:
         loss_function: Primary loss function
         custom_loss: Custom loss for imputation
         data_sampler: Missing data mechanism sampler
-        diffusion_sampler: Diffusion-based imputation sampler
         metrics: Metrics calculator instance
     """
 
@@ -59,7 +58,7 @@ class ModelTrainer:
             config: Dictionary containing all training parameters and components.
                    Required keys: input_dim, hidden_dim, seq_length, output_dim,
                    num_steps, num_epochs, device, num_layers, optimizer,
-                   loss_function, custom_loss, data_sampler, diffusion_sampler
+                   loss_function, custom_loss, data_sampler
 
         Raises:
             KeyError: If required configuration keys are missing
