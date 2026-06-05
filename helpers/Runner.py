@@ -25,7 +25,6 @@ from models.GTACM import GTACMNetwork
 from trainer_helper import ModelTrainer
 from utils.afail_loss import EDMAFAILLoss
 from utils.missing_mecanisms import DataSampler
-from diffusion_utils.sampling import FASIGSSamplerEuler2nd
 optimizer_config = {
     "lr": 3e-4,
     "betas": (0.9, 0.95),
