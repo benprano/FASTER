@@ -25,7 +25,6 @@ from models.GTACM import GTACMNetwork
 from trainer_helper import ModelTrainer
 from utils.afail_loss import EDMAFAILLoss
 from utils.missing_mecanisms import DataSampler
-from diffusion_utils.sampling import FASIGSSamplerEuler2nd
 optimizer_config = {
     "lr": 3e-4,
     "betas": (0.9, 0.95),
@@ -216,10 +215,6 @@ class ExperimentRunner:
         # Custom loss for imputation evaluation
         custom_loss = EDMAFAILLoss(device=device).to(device)
 
-        # Diffusion-based sampler for imputation
-        diffusion_sampler = FASIGSSamplerEuler2nd(
-            model, num_steps=timesteps, device=device
-        )
 
         return {
             'model': model,
@@ -227,7 +222,6 @@ class ExperimentRunner:
             'scheduler': scheduler,
             'loss_function': loss_function,
             'custom_loss': custom_loss,
-            'diffusion_sampler': diffusion_sampler,
             'seq_length': seq_length,
             'input_dim': input_dim,
             'hidden_dim': hidden_dim,
@@ -535,7 +529,6 @@ class ExperimentRunner:
             'scheduler': scheduler,
             'loss_function': components['loss_function'],
             'custom_loss': components['custom_loss'],
-            'diffusion_sampler': components['diffusion_sampler'],
         }
 
         trainer = ModelTrainer(trainer_config)
