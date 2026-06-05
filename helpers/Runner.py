@@ -215,18 +215,12 @@ class ExperimentRunner:
         # Custom loss for imputation evaluation
         custom_loss = EDMAFAILLoss(device=device).to(device)
 
-        # Diffusion-based sampler for imputation
-        diffusion_sampler = FASIGSSamplerEuler2nd(
-            model, num_steps=timesteps, device=device
-        )
-
         return {
             'model': model,
             'optimizer': optimizer,
             'scheduler': scheduler,
             'loss_function': loss_function,
             'custom_loss': custom_loss,
-            'diffusion_sampler': diffusion_sampler,
             'seq_length': seq_length,
             'input_dim': input_dim,
             'hidden_dim': hidden_dim,
@@ -537,7 +531,6 @@ class ExperimentRunner:
             'scheduler': scheduler,
             'loss_function': components['loss_function'],
             'custom_loss': components['custom_loss'],
-            'diffusion_sampler': components['diffusion_sampler'],
         }
 
         trainer = ModelTrainer(trainer_config)
